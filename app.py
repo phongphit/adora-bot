@@ -1,52 +1,90 @@
 from flask import Flask, request
 from openai import OpenAI
-from dotenv import load_dotenv
 import os
+import requests
 
-# โหลดค่าใน .env เช่น OPENAI_API_KEY, VERIFY_TOKEN
-load_dotenv()
+# โหลดค่า Environment Variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
-# สร้าง client ด้วย key จาก .env
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# สร้าง OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
+# สร้าง Flask app
 app = Flask(__name__)
 
-# ฟังก์ชันคุยกับ GPT
-def get_gpt_reply(message):
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",  # หรือ gpt-4 ถ้ามีพร้อม
-        messages=[
-            {"role": "user", "content": message}
-        ],
-        temperature=0.6,
-    )
-    return response.choices[0].message.content
+# ฟังก์ชันส่งข้อความกลับไปที่ Messenger
+def send_message(recipient_id, message_text):
+    url = "https://graph.facebook.com/v19.0/me/messages"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": message_text},
+        "messaging_type": "RESPONSE",
+    }
+    params = {"access_token": PAGE_ACCESS_TOKEN}
+    response = requests.post(url, headers=headers, params=params, json=payload)
 
-# Webhook จาก Facebook (GET สำหรับ verify, POST สำหรับตอบข้อความ)
+    if response.status_code != 200:
+        print(f"❌ ไม่สามารถส่งข้อความได้: {response.status_code} - {response.text}")
+    else:
+        print(f"✅ ส่งข้อความสำเร็จถึง {recipient_id}")
+
+# ฟังก์ชันเรียก GPT มาตอบ
+def ask_gpt(message_text):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",  # หรือ gpt-4, gpt-3.5-turbo แล้วแต่ plan พี่โอ
+            messages=[
+                {"role": "system", "content": "คุณคือนักช่วยตอบข้อความลูกค้าบน Facebook อย่างสุภาพและกระชับ"},
+                {"role": "user", "content": message_text}
+            ],
+            temperature=0.5,
+            max_tokens=300,
+        )
+        reply = response.choices[0].message.content.strip()
+        return reply
+    except Exception as e:
+        print(f"❌ GPT Error: {str(e)}")
+        return "ขออภัย ระบบไม่สามารถตอบกลับได้ในขณะนี้"
+
+# Endpoint สำหรับ Facebook Webhook (GET = Verify, POST = รับข้อความ)
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        verify_token = os.getenv("VERIFY_TOKEN", "adora_token_999")
-        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == verify_token:
-            return request.args.get("hub.challenge"), 200
-        return "Verification token mismatch", 403
+        # สำหรับ Verify Token ตอนตั้ง Webhook
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            print("✅ Webhook Verified!")
+            return challenge, 200
+        else:
+            print("❌ Webhook Verification Failed")
+            return "Verification token mismatch", 403
 
     elif request.method == "POST":
-        try:
-            data = request.get_json()
-            sender_id = data["entry"][0]["messaging"][0]["sender"]["id"]
-            user_msg = data["entry"][0]["messaging"][0]["message"]["text"]
+        # รับข้อความจาก Facebook
+        data = request.get_json()
+        print(f"📩 Webhook POST: {data}")
 
-            print(f"📥 รับข้อความจาก: {sender_id}")
-            print(f"💬 ข้อความ: {user_msg}")
+        if "object" in data and data["object"] == "page":
+            for entry in data.get("entry", []):
+                for messaging_event in entry.get("messaging", []):
+                    sender_id = messaging_event["sender"]["id"]
+                    if "message" in messaging_event and "text" in messaging_event["message"]:
+                        user_message = messaging_event["message"]["text"]
 
-            bot_reply = get_gpt_reply(user_msg)
-            print(f"🤖 GPT ตอบกลับ: {bot_reply}")
+                        # ส่งข้อความที่ผู้ใช้พิมพ์ → ไปถาม GPT
+                        bot_reply = ask_gpt(user_message)
 
-            return "OK", 200
-        except Exception as e:
-            print(f"❌ ERROR: {e}")
-            return "Internal Server Error", 500
+                        # ส่งข้อความตอบกลับไปยัง Messenger
+                        send_message(sender_id, bot_reply)
 
+        return "ok", 200
+
+# รัน app
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(port=6969)
